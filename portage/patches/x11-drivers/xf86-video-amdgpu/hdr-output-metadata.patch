@@ -1,0 +1,151 @@
+--- a/src/drmmode_display.h
++++ b/src/drmmode_display.h
+@@ -164,6 +164,9 @@
+ 	int enc_mask;
+ 	int enc_clone_mask;
+ 	int tear_free;
++	/* KMS HDR_OUTPUT_METADATA, 0 if the connector has none */
++	uint32_t hdr_metadata_prop_id;
++	Atom hdr_metadata_atom;
+ } drmmode_output_private_rec, *drmmode_output_private_ptr;
+ 
+ typedef struct {
+--- a/src/drmmode_display.c
++++ b/src/drmmode_display.c
+@@ -2251,6 +2251,95 @@
+ 	return FALSE;
+ }
+ 
++/*
++ * HDR_OUTPUT_METADATA: the KMS blob as a RandR byte array, either a whole
++ * struct hdr_output_metadata or a single 0 byte for none. This is what lets
++ * an X client (an HDR video player) switch the sink into HDR mode.
++ */
++static void drmmode_output_create_hdr_metadata(xf86OutputPtr output,
++					       uint32_t blob_id)
++{
++	drmmode_output_private_ptr drmmode_output = output->driver_private;
++	AMDGPUEntPtr pAMDGPUEnt = AMDGPUEntPriv(output->scrn);
++	drmModePropertyBlobPtr blob = NULL;
++	uint8_t zero = 0;
++	void *data = &zero;
++	unsigned long length = 1;
++	int err;
++
++	drmmode_output->hdr_metadata_atom =
++		MakeAtom("HDR_OUTPUT_METADATA", 19, TRUE);
++	if (drmmode_output->hdr_metadata_atom == BAD_RESOURCE) {
++		drmmode_output->hdr_metadata_prop_id = 0;
++		return;
++	}
++
++	if (blob_id)
++		blob = drmModeGetPropertyBlob(pAMDGPUEnt->fd, blob_id);
++	if (blob && blob->length == sizeof(struct hdr_output_metadata)) {
++		data = blob->data;
++		length = blob->length;
++	}
++
++	err = RRChangeOutputProperty(output->randr_output,
++				     drmmode_output->hdr_metadata_atom,
++				     XA_INTEGER, 8, PropModeReplace, length,
++				     data, FALSE, FALSE);
++	if (err != Success)
++		xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
++			   "Changing HDR_OUTPUT_METADATA property failed with %d\n",
++			   err);
++	drmModeFreePropertyBlob(blob);
++}
++
++static Bool drmmode_output_set_hdr_metadata(xf86OutputPtr output,
++					    RRPropertyValuePtr value)
++{
++	drmmode_output_private_ptr drmmode_output = output->driver_private;
++	AMDGPUEntPtr pAMDGPUEnt = AMDGPUEntPriv(output->scrn);
++	uint32_t blob_id = 0;
++	int ret;
++
++	if (value->type != XA_INTEGER || value->format != 8)
++		return FALSE;
++
++	if (value->size == sizeof(struct hdr_output_metadata)) {
++		ret = drmModeCreatePropertyBlob(pAMDGPUEnt->fd, value->data,
++						value->size, &blob_id);
++		if (ret) {
++			xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
++				   "Creating DRM blob failed with errno %d\n",
++				   ret);
++			return FALSE;
++		}
++	} else if (value->size != 1 || *(uint8_t *)value->data != 0) {
++		return FALSE;
++	}
++
++	/* Entering or leaving HDR (blob 0 <-> non-0) is a full modeset in
++	 * amdgpu; changing one blob for another is not.
++	 */
++	ret = drmModeConnectorSetProperty(pAMDGPUEnt->fd,
++					  drmmode_output->output_id,
++					  drmmode_output->hdr_metadata_prop_id,
++					  blob_id);
++
++	/* If successful, kernel will have a reference already. Safe to destroy
++	 * the blob either way.
++	 */
++	if (blob_id)
++		drmModeDestroyPropertyBlob(pAMDGPUEnt->fd, blob_id);
++
++	if (ret) {
++		xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
++			   "Setting HDR_OUTPUT_METADATA failed with errno %d\n",
++			   ret);
++		return FALSE;
++	}
++
++	return TRUE;
++}
++
+ static void drmmode_output_create_resources(xf86OutputPtr output)
+ {
+ 	AMDGPUInfoPtr info = AMDGPUPTR(output->scrn);
+@@ -2259,6 +2348,7 @@
+ 	drmModeConnectorPtr mode_output = drmmode_output->mode_output;
+ 	AMDGPUEntPtr pAMDGPUEnt = AMDGPUEntPriv(output->scrn);
+ 	drmModePropertyPtr drmmode_prop, tearfree_prop;
++	uint32_t hdr_metadata_blob_id = 0;
+ 	int i, j, err;
+ 	Atom name;
+ 
+@@ -2292,6 +2382,11 @@
+ 	for (i = 0, j = 0; i < mode_output->count_props; i++) {
+ 		drmmode_prop =
+ 		    drmModeGetProperty(pAMDGPUEnt->fd, mode_output->props[i]);
++		if (drmmode_prop && (drmmode_prop->flags & DRM_MODE_PROP_BLOB) &&
++		    !strcmp(drmmode_prop->name, "HDR_OUTPUT_METADATA")) {
++			drmmode_output->hdr_metadata_prop_id = drmmode_prop->prop_id;
++			hdr_metadata_blob_id = mode_output->prop_values[i];
++		}
+ 		if (drmmode_property_ignore(drmmode_prop)) {
+ 			drmModeFreeProperty(drmmode_prop);
+ 			continue;
+@@ -2402,6 +2497,9 @@
+ 		}
+ 	}
+ 
++	if (drmmode_output->hdr_metadata_prop_id)
++		drmmode_output_create_hdr_metadata(output, hdr_metadata_blob_id);
++
+ 	drmmode_crtc = output->crtc ? output->crtc->driver_private : NULL;
+ 
+ 	for (i = 0; i < CM_NUM_PROPS; i++) {
+@@ -2436,6 +2534,10 @@
+ 	enum drmmode_cm_prop cm_prop_index;
+ 	int i;
+ 
++	if (drmmode_output->hdr_metadata_prop_id &&
++	    property == drmmode_output->hdr_metadata_atom)
++		return drmmode_output_set_hdr_metadata(output, value);
++
+ 	cm_prop_index = get_cm_enum_from_str(NameForAtom(property));
+ 	if (cm_prop_index >= 0 && cm_prop_index < CM_DEGAMMA_LUT_SIZE) {
+ 		if (!output->crtc)

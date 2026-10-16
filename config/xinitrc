@@ -1,0 +1,5 @@
+# In ~/.xinitrc, before the window manager starts:
+# sRGB colours on the wide-gamut panel, in the display hardware.
+colormode srgb >/dev/null 2>&1
+# HDR while an HDR video is fullscreen and on screen (log: runtime dir).
+colormode watch 2>"${XDG_RUNTIME_DIR:-/tmp}/colormode.log" &
